@@ -115,7 +115,7 @@ async fn main(spawner: Spawner) {
 
         if !is_retry {
             // Might be a false reading, check again in 1 minute
-            delay_in_secs = 60;
+            delay_in_secs = READING_RETRY_SECS;
             is_retry = true;
             continue;
         }
