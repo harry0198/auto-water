@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+
 use cyw43::aligned_bytes;
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
@@ -11,11 +12,14 @@ use embassy_rp::gpio::{Level, Output, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::{bind_interrupts, dma};
-use embassy_time::{Timer};
+use embassy_time::{Duration, Timer};
 use panic_probe as _;
 use static_cell::StaticCell;
 
-
+const PUMP_ON_TIME_SECS: u8 = 6;
+const READING_DELAY_SECS: u32 = 6 * 60 * 60;
+const READING_RETRY_SECS: u32 = 60; // Retry delay in case bad reading
+const MOISTURE_THRESHOLD: u8 = 40;
 const CALIBRATION_MOISTURE_DRY: u32 = 2971;
 const CALIBRATION_MOISTURE_WET: u32 = 800;
 const MIN_SAMPLES: u8 = 6; // Amount of samples before reading is deemed inaccurate.
@@ -76,12 +80,17 @@ async fn main(spawner: Spawner) {
     let mut moisture_pwr = Output::new(p.PIN_16, Level::Low);
     let mut adc = Adc::new(p.ADC, Irqs, AdcConfig::default());
     let mut moisture_input = Channel::new_pin(p.PIN_26, Pull::None);
-    let mut pump_pwt = Output::new(p.PIN_15, Level::Low);
+    let mut pump_pwr = Output::new(p.PIN_15, Level::Low);
+
+    let mut delay_in_secs = READING_DELAY_SECS;
+    let mut is_retry = false;
 
     loop {
-        info!("sensor on, reading...");
+        info!("Wait start");
+        Timer::after_secs(delay_in_secs as u64).await;
+        info!("Wait end");
+
         control.gpio_set(0, true).await;
-        Timer::after_millis(100).await; // let the sensor output settle
 
         let moisture_raw = get_moisture_raw(&mut moisture_pwr, &mut adc, &mut moisture_input).await;
 
@@ -99,10 +108,30 @@ async fn main(spawner: Spawner) {
             }
         };
 
-        println!("moisture {}", &moisture);
-       
-        Timer::after_millis(3000).await;
+        if moisture > MOISTURE_THRESHOLD {
+            is_retry = false;
+            continue;
+        }
+
+        if !is_retry {
+            // Might be a false reading, check again in 1 minute
+            delay_in_secs = 60;
+            is_retry = true;
+            continue;
+        }
+
+        delay_in_secs = READING_DELAY_SECS;
+
+        cycle_pump(&mut pump_pwr, Duration::from_secs(PUMP_ON_TIME_SECS as u64)).await;
     }
+}
+
+async fn cycle_pump(pump: &mut Output<'_>, duration: Duration) {
+    info!("Pump cycle start");
+    pump.set_high();
+    Timer::after(duration).await;
+    pump.set_low();
+    info!("Pump cycle ended");
 }
 
 fn normalise_moisture(raw: u16) -> u8 {
